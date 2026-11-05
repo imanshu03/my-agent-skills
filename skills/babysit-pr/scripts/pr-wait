@@ -11,8 +11,9 @@ Progress and errors that do not end the run go to stderr.
 --until
   green       required checks passed on the current head (every CI check when
               the base branch requires none)
-  ready      green, Greptile or Macroscope reviewed the current head, and no
-              review thread is unresolved (default)
+  ready       green, every gating review bot that appeared on the PR (Greptile,
+              Macroscope, Codex, Claude) reviewed the current head, at least
+              one did, and no review thread is unresolved (default)
   any-change  stop after the first poll that prints an event
 
 Exit codes
@@ -27,13 +28,17 @@ Events
   - all checks finished on the head (one summary line)
   - a new comment, review, thread, or thread reply from someone other than the
     PR author or the gh user
-  - Greptile, Macroscope, or CodeRabbit finished on the head, or a Greptile or
-    Macroscope summary changed after that
+  - Greptile, Macroscope, Codex, Claude, or CodeRabbit finished on the head, or
+    a gating bot's summary changed after that
   - the base branch moved and the new commits touch files in this PR
   - merge state became BEHIND or DIRTY
   - the PR merged or closed
 
-CodeRabbit is advisory: pr-wait reports it but never waits for it. Comment
+A review bot is done on the head when its checks finish. A bot without checks
+is done when it reviews the head commit, names the head in a comment, comments
+after the head commit, or (Codex) adds a thumbs-up to the PR after the head
+commit. Only Bot accounts count, so a user named like a bot cannot mark it
+done. CodeRabbit is advisory: pr-wait reports it but never waits for it. Comment
 edits are never events, and top-level comments from CI and deploy bots
 (github-actions, Vercel) are skipped, because checks already carry that news.
 
@@ -59,7 +64,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, NoReturn
 
-GATING_BOTS = ("greptile", "macroscope")
+GATING_BOTS = ("greptile", "macroscope", "codex", "claude")
 ADVISORY_BOTS = ("coderabbit",)
 # CI and deploy bots report through checks. Their PR comments are status reports.
 STATUS_BOTS = ("github-actions", "vercel", "netlify", "railway", "cloudflare")
@@ -86,7 +91,8 @@ query($owner: String!, $name: String!, $number: Int!) {
       url state headRefOid baseRefName mergeStateStatus
       author { login }
       baseRef { target { oid } }
-      comments(last: 100) { nodes { id url body author { login __typename } } }
+      commits(last: 1) { nodes { commit { committedDate } } }
+      comments(last: 100) { nodes { id url body createdAt author { login __typename } } }
       reviews(last: 100) {
         nodes { id url state body commit { oid } author { login __typename } }
       }
@@ -320,6 +326,17 @@ class Watcher:
                 checks[row["name"]] = row
         return checks
 
+    def fetch_bot_reactions(self) -> list[tuple[str, str, str]]:
+        """Reactions by Bot accounts on the PR body, as (login, content, created_at).
+        Codex reacts with eyes when it starts and thumbs-up when it finds nothing."""
+        jq = '.[] | select(.user.type == "Bot") | [.user.login, .content, .created_at] | @tsv'
+        try:
+            rows = gh_lines(["api", f"repos/{self.repo}/issues/{self.pr}/reactions?per_page=100", "--jq", jq])
+        except GhError as error:
+            log(f"could not read PR reactions: {error}")
+            return []
+        return [tuple(row.split("\t")) for row in rows if row.count("\t") == 2]  # type: ignore[misc]
+
     def base_overlap(self, head: str, old: str, new: str) -> list[str]:
         """Files this PR touches that the new base commits also touch."""
         try:
@@ -356,6 +373,8 @@ class Watcher:
         checks = self.fetch_checks()
         head = pr["headRefOid"]
         short = head[:7]
+        head_commits = pr["commits"]["nodes"]
+        head_time = head_commits[0]["commit"]["committedDate"] if head_commits else ""
         mine = {who(pr)[0], pr["viewer"]}
         comments = pr["comments"]["nodes"]
         reviews = pr["reviews"]["nodes"]
@@ -417,16 +436,28 @@ class Watcher:
         # summary names the head.
         bot_status: dict[str, str] = {}
         reviewed: list[str] = []
+        waiting: list[str] = []
+        reactions: list[tuple[str, str, str]] | None = None
         for bot in GATING_BOTS + ADVISORY_BOTS:
             own_checks = {name: c for name, c in checks.items() if bot_name(name) == bot}
-            summaries = [c for c in comments if bot_name(who(c)[0]) == bot]
-            own_reviews = [r for r in reviews if bot_name(who(r)[0]) == bot]
+            # Count only Bot accounts, so a user named like a bot cannot mark it done.
+            summaries = [c for c in comments if who(c)[1] and bot_name(who(c)[0]) == bot]
+            own_reviews = [r for r in reviews if who(r)[1] and bot_name(who(r)[0]) == bot]
             on_head = any((r.get("commit") or {}).get("oid") == head for r in own_reviews)
+            after_head = bool(head_time) and any(s.get("createdAt", "") > head_time for s in summaries)
+            own_reactions: list[tuple[str, str, str]] = []
+            if bot == "codex" and not own_checks:
+                if reactions is None:  # one REST call per poll, only when Codex needs it
+                    reactions = self.fetch_bot_reactions()
+                own_reactions = [r for r in reactions if bot_name(r[0]) == bot]
+            thumbs_up = bool(head_time) and any(r[1] == "+1" and r[2] > head_time for r in own_reactions)
             if own_checks:
                 done = all(c["bucket"] != "pending" for c in own_checks.values())
             else:
-                done = on_head or any(short in s["body"] for s in summaries)
-            seen = bool(own_checks or summaries or own_reviews)
+                done = on_head or after_head or thumbs_up or any(short in s["body"] for s in summaries)
+            seen = bool(own_checks or summaries or own_reviews or own_reactions)
+            if bot in GATING_BOTS and seen and not done:
+                waiting.append(bot)
             if bot in ADVISORY_BOTS and own_checks:
                 desc = next(iter(own_checks.values()))
                 bot_status[bot] = f"{bot} {desc['description'] or desc['bucket']} (advisory)"
@@ -486,7 +517,7 @@ class Watcher:
             if self.required
             else "",
             ", ".join(bot_status[b] for b in GATING_BOTS + ADVISORY_BOTS if b in bot_status)
-            or "no Greptile or Macroscope yet",
+            or "no review bot yet",
             f"{len(unresolved)} unresolved threads",
             f"merge state {merge_state}",
         ]
@@ -503,8 +534,8 @@ class Watcher:
             if green and self.until == "green":
                 self.reported.add(checks_key)
                 self.finish(0, [f"green on {short}: {summary}{self.behind(base, base_oid, head)}"])
-            # ready waits for Greptile or Macroscope, never for CodeRabbit.
-            if green and reviewed:
+            # ready waits for every gating bot seen on the PR, never for CodeRabbit.
+            if green and reviewed and not waiting:
                 if unresolved:
                     self.finish(1, [f"blocked by {len(unresolved)} unresolved threads on {short}: {' '.join(unresolved)}"])
                 if merge_state == "BEHIND":

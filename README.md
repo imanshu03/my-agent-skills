@@ -58,6 +58,8 @@ skills without losing them.
 - `leaving-pr-comments` now holds my Conventional Comments review guidance, in
   place of the original attribution note.
 - `deslop` is new. `leaving-pr-comments` uses it to write clear, plain comments.
+- `babysit-pr` also waits for the Codex and Claude review bots. `pr-wait` waits
+  for every gating bot on the PR, and it counts only Bot accounts as review bots.
 
 ## License
 

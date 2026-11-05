@@ -48,10 +48,10 @@ It prints one line per real event. It exits 0 when the `--until` condition is
 met or the PR merges, 1 when it needs you (a required check failed, conflicts,
 unresolved threads, PR closed), and 2 on bad input.
 
-- `ready` (default): required checks green, Greptile or Macroscope reviewed the
-  head, and no unresolved threads. Use this to babysit.
-- `green`: required checks only. Use it when the repo has no Greptile or
-  Macroscope.
+- `ready` (default): required checks green, every gating review bot on the PR
+  reviewed the head, and no unresolved threads. The gating bots are Greptile,
+  Macroscope, Codex, and Claude. Use this to babysit.
+- `green`: required checks only. Use it when the repo has no gating review bot.
 - `any-change`: exit on the first event.
 
 In Claude Code, run it with the Monitor tool (`timeout_ms: 3600000`), so each
@@ -82,6 +82,11 @@ with a written reason when dismissing false positives.
 
 If the repo has `.macroscope/check-run-agents/*.md`, read those rules before you
 reply to a Macroscope finding. Its findings cite them.
+
+Codex reviews a PR when it opens, and it may not review again after a push.
+If `pr-wait` reports `codex pending` on a new head, comment `@codex review` to
+ask for a review. When Codex finds nothing, it adds a thumbs-up to the PR in
+place of a review.
 
 CodeRabbit is advisory. Treat its findings like any other finding, but never
 wait for it and never hold a merge for it.
